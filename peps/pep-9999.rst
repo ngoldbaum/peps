@@ -1,0 +1,1052 @@
+PEP: 9999
+Title: Stable Reads for the Buffer Protocol
+Author: Nathan Goldbaum <nathan.goldbaum@gmail.com>
+Discussions-To: Pending
+Status: Draft
+Type: Standards Track
+Requires: 820
+Created: 10-Jul-2026
+Python-Version: 3.16
+Post-History: Pending
+
+.. highlight:: c
+
+
+Abstract
+========
+
+The `Python buffer protocol
+<https://docs.python.org/3/c-api/buffer.html>`__ lets modules share
+memory without copying it.  A ``Py_buffer`` describes the address,
+layout, format, and writability of that memory.  The protocol does not
+let a consumer request that the memory remain unchanged while it is
+being read: a read-only view prevents writes through that view, not
+writes through another alias.
+
+This PEP adds ``PyBUF_STABLE_READ``, an opt-in buffer request flag
+that only types satisfying the requirements in `Exporter Audit`_ may
+support.  A successful request returns a read-only *stable export*: the
+bytes and metadata described by the view cannot change until the
+consumer releases it.  After
+acquisition and before release, native code may read the protected
+memory while its thread state is detached.
+
+An exporter rejects a stable request that overlaps a write-capable
+export or another conflicting operation.  It likewise rejects a new
+write or writable export while a stable export is active.  Python
+interfaces report the conflict with ``BufferConflictError``, a new
+``BufferError`` subclass.  The operation fails when it reaches the
+exporter's conflict check; it does not wait for the active operation
+to finish.
+
+Python code requests a stable view with ``access="stable-read"`` on
+``memoryview()`` or ``io.BytesIO.getbuffer()``.  Existing buffer
+structures, function signatures, and flag values are unchanged, as are
+valid requests using existing documented flags for types that do not
+opt in.
+
+
+Motivation
+==========
+
+:pep:`3118` and the buffer documentation define layout, lifetime, and
+writability, but not stable access.  ``Py_buffer.readonly`` restricts
+the current consumer; it does not stabilize mutable storage.  The
+difference is visible without threads:
+
+.. code-block:: python
+
+   data = bytearray(b"abcd")
+   reader = memoryview(data).toreadonly()
+   writer = memoryview(data)
+
+   writer[0] = ord("x")
+   assert reader[0] == ord("x")
+
+Both views remain valid.  ``reader`` cannot write, but it immediately
+sees writes made through ``writer``.  ``bytearray`` prevents resizing
+while either view exists; it does not prevent same-size writes.
+
+In a free-threaded build, reading through one valid memoryview can race
+at the C level with writing through another.  `python/cpython#130977
+<https://github.com/python/cpython/issues/130977>`__ demonstrates such
+a race under ThreadSanitizer.  For mutable storage exposed through
+memoryviews, the generic remedy is external synchronization: the
+`memoryview thread-safety guarantees
+<https://docs.python.org/3/library/threadsafety.html#thread-safety-for-memoryview-objects>`__
+require external synchronization around mutable backing storage.
+
+The same problem exists in a GIL-enabled build, because CPython
+routinely reads buffers with the thread state detached.  ``hashlib``
+releases the GIL while it hashes large inputs, and the compression
+modules do the same while they consume input buffers.  Any code that
+acquires a buffer, detaches, and passes ``view->buf`` to native
+parsing or hashing code is exposed: the export keeps the allocation
+alive, but another thread can acquire a different view and change its
+contents.
+
+``io.BytesIO`` provides a concrete standard-library example.
+``getbuffer()`` returns writable memoryviews, and several can exist at
+once.  A native reader may read the stream through one view while
+another thread writes through another.  Nothing in the current
+protocol coordinates them.
+
+With this proposal, a caller can instead request stable access:
+
+.. code-block:: python
+
+   stream = io.BytesIO(b"abcd")
+   view = stream.getbuffer(access="stable-read")
+
+   assert bytes(view) == b"abcd"
+   stream.write(b"xy")             # raises BufferConflictError
+
+   view.release()
+   stream.write(b"xy")             # succeeds
+
+
+Proposal Overview
+=================
+
+A consumer requests a stable read by adding ``PyBUF_STABLE_READ`` to
+an otherwise valid request that does not include ``PyBUF_WRITABLE``.
+CPython checks the request against a capability mask declared by the
+exact exporter type.  An undeclared capability raises plain
+``BufferError`` without passing the flag to the exporter
+(`Declaring Support`_).
+
+The exporter checks its active operations.  A conflict raises
+``BufferConflictError`` at that check; the request does not wait for
+the conflicting operation to end.  Otherwise the exporter returns a
+read-only view.  For mutable storage, a stable-export record is active
+before the call returns and excludes writes or invalidation until
+release.  Stable readers may coexist with one another and with other
+read-only access.  The guarantee covers one ``Py_buffer`` for one
+export; it does not make the exporter permanently immutable.  Immutable
+storage needs no per-export state.  See
+`Coordination Domains and Conflicts`_.
+
+Support belongs to an audited exact type, not to the buffer protocol
+in general.  Ordinary buffer support, a read-only result, or a
+declaration on a base class is insufficient (`Declaring Support`_).
+CPython's initial declarations are listed in `Initially Supported
+Types`_.  Third-party heap types with controlled access paths can use
+the public declaration API; static-type declarations are deferred
+(`Future Directions`_).
+
+
+Goals and Non-Goals
+===================
+
+This PEP provides:
+
+* zero-copy stable reads for native consumers on GIL-enabled and
+  free-threaded builds;
+* an explicit request that leaves ordinary buffer acquisition
+  unchanged;
+* coordination across the aliases and wrappers that an audited
+  exporter provides for the same storage; and
+* immediate failure after a conflict is observed, rather than waiting
+  for a conflicting export to end.
+
+This PEP does not:
+
+* coordinate ownership, handoff, or release among consumers that share
+  one stable export;
+* make ordinary buffer acquisitions safe with respect to one another;
+* provide blocking acquisition or a progress guarantee for retries;
+* support declarations by pure-Python :pep:`688` exporters;
+* require exact overlap analysis for arbitrary strided or indirect
+  views;
+* control pointers obtained by violating an interface contract; or
+* validate layout, alignment, or element validity before a consumer
+  interprets the view as a typed native array.
+
+
+Specification
+=============
+
+The sections below are normative.  `Stable-Read Semantics`_ defines
+the guarantee and the conflict rules; `Python API`_ and
+`C Consumer API`_ specify the consumer-facing interfaces;
+`Exporter API and Requirements`_ specifies the obligations of a
+declaring type; and `Initially Supported Types`_ lists the exporters
+that CPython itself declares.
+
+
+Stable-Read Semantics
+---------------------
+
+
+The Guarantee
+~~~~~~~~~~~~~
+
+A *stable export* is a ``Py_buffer`` acquired with a request containing
+``PyBUF_STABLE_READ`` (`The Stable-Read Request Flag`_).  It carries
+the exporter's stability guarantee, which the consumer may rely on
+from the moment ``bf_getbuffer`` succeeds.
+
+The view's *protected memory and metadata* are:
+
+* every element byte addressable through ``buf``, ``shape``,
+  ``strides``, and ``suboffsets``;
+* every pointer cell followed when applying ``suboffsets``;
+* the contents of the ``format`` string and the ``shape``, ``strides``,
+  and ``suboffsets`` arrays; and
+* the storage holding those bytes, pointer cells, and metadata,
+  together with whatever ownership keeps that storage valid at the
+  described addresses.
+
+The returned ``Py_buffer`` describes a fixed interpretation for the life
+of the export.  The consumer must not modify it or its metadata.
+
+Until the consumer begins ``PyBuffer_Release()``, no interface provided
+by the exporter, used according to its contract, may:
+
+* write protected memory or metadata;
+* grant new access that permits such a write; or
+* relocate, free, rebind, or otherwise invalidate anything described by
+  the view.
+
+The guarantee does not extend through pointer-valued elements.  For
+example, an array element that contains an address does not protect the
+storage at that address.
+
+The consumer must not access the view concurrently with or after
+``PyBuffer_Release()``.  Exporter protection lasts slightly longer: the
+stable export remains active until its ``bf_releasebuffer`` callback
+returns.  Only then may the exporter admit an operation that the export
+excluded.
+
+Memory that another process, a device, or the kernel can write is
+eligible only if the exporter prevents or coordinates those writes.
+Writing through a read-only pointer, retaining a pointer past its
+documented endpoint, and reaching into allocation internals remain API
+violations and are outside the guarantee.
+
+
+Coordination Domains and Conflicts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The guarantee is only as strong as the set of access paths it covers,
+so the unit of coordination is the storage, not whichever object
+happens to export it.  A *coordination domain* is the storage over
+which one conflict check operates.  It may be an allocation, an
+exporter object, or a larger object graph.  If several exporter
+instances can reach the same protected storage, they must use the same
+domain state.  An exporter may conservatively coordinate a whole
+allocation even when two views reach disjoint bytes.  For example, the
+private exporter behind ``io.BytesIO`` uses one domain for all views
+of one stream's storage.
+
+The operations relevant to a domain are:
+
+* a stable export, active from its conflict check until
+  ``bf_releasebuffer`` returns;
+* an ordinary export that may permit writing, active from successful
+  ``bf_getbuffer`` until ``bf_releasebuffer`` returns;
+* a bounded write or storage change, active until the operation
+  publishes completion; and
+* a long-lived write-capable access, such as a raw pointer, active
+  until the endpoint defined by that interface.
+
+A stable export thus begins excluding conflicting operations slightly
+before its consumer-visible guarantee begins: exclusion starts at the
+conflict check, before ``bf_getbuffer`` returns.  Write-capable access
+must have acquisition and separate release points that the exporter
+can observe and coordinate.  Object destruction alone is not an
+adequate endpoint; a type that provides such access is ineligible to
+declare support
+(`Exporter Audit`_).
+
+Omitting ``PyBUF_WRITABLE`` does not by itself make an ordinary request
+read-only.  Under the existing protocol, an exporter may answer such a
+request with either a writable or read-only view.  An ordinary request
+is treated as *known read-only* only when the exporter can determine,
+before granting it, that the request cannot produce write access.
+Otherwise it is treated as *possibly writable*.
+
+Compatibility with a live stable export is:
+
+===========================================  ============================
+New operation                                Result
+===========================================  ============================
+Stable acquisition                           Compatible
+Known read-only ordinary acquisition         Compatible
+Possibly writable ordinary acquisition       Conflict
+Write to protected memory or metadata        Conflict
+Storage change that reaches the view         Conflict
+Storage change that cannot reach the view    Compatible
+Long-lived write-capable access              Conflict
+===========================================  ============================
+
+The conflict is symmetric: a stable request likewise conflicts with an
+active possibly writable export, write, storage change, or long-lived
+write-capable access.  A conflicting operation fails when it reaches
+the domain's conflict check; it does not wait for the active operation
+to end.
+
+When no stable export or stable request is involved, this PEP adds no
+conflict rule among ordinary operations.  Existing exporter and
+buffer-lifetime rules continue to apply.  Ordinary reads participate
+in no stable-read conflict check.
+
+A storage change reaches a live view when it can change or invalidate
+the bytes or metadata described by that view.  An exporter may avoid a
+conflict by switching itself to new private storage and modifying only
+that storage, provided the old allocation and every live view of it
+remain unchanged.  Outside buffer-export windows, ``BytesIO`` already
+uses a related copy-on-write technique when its allocation is shared
+with a ``bytes`` object returned by ``getvalue()``.
+
+
+Python API
+----------
+
+Python exposes stable reads through a keyword argument rather than a
+new type or method, so existing construction idioms keep working.
+Python spells the request with the case-sensitive string
+``"stable-read"``.  Each ``access`` parameter added by this PEP accepts
+``None`` or that string.  Other strings raise ``ValueError``; values of
+other types raise ``TypeError``.
+
+``BufferConflictError`` is a new built-in subclass of ``BufferError``.
+It reports a supported operation that cannot proceed because an
+incompatible operation is active now.  It does not promise that
+retrying will eventually succeed.
+
+This PEP adds no Python query for stable-read support.  Attempting the
+acquisition and handling ``BufferError`` is the buffer protocol's
+existing idiom; richer capability introspection is deferred
+(`Future Directions`_).
+
+
+Stable Memoryviews
+~~~~~~~~~~~~~~~~~~
+
+The ``memoryview`` constructor gains one keyword-only parameter:
+
+.. code-block:: python
+
+   memoryview(object, /, *, access=None)
+
+``access=None`` preserves the existing behavior.  With
+``access="stable-read"``, construction adds ``PyBUF_STABLE_READ`` to
+the buffer request.  The resulting memoryview is read-only and holds
+the stable export through its *managed buffer*, the internal object
+through which a memoryview and every view derived from it share one
+underlying export.  The export remains active until the stable
+memoryview and every dependent view have released their access.
+
+``PyMemoryView_FromObject()`` continues to match
+``memoryview(object)``.  C code can request a stable memoryview by
+calling the type with the keyword argument; a flags-taking constructor
+is deferred (`Future Directions`_).  The ``__buffer__`` wrapper for a C
+exporter applies the same gate as ``PyObject_GetBuffer()``.  Therefore
+``obj.__buffer__(inspect.BufferFlags.STABLE_READ)``, whose implied base
+representation is ``PyBUF_SIMPLE``, succeeds only for an exporter that
+understands stable requests (`Acquiring a Stable Export`_).
+
+The exact ``memoryview`` type itself understands ``PyBUF_STABLE_READ``
+and propagates stability instead of re-checking it.  Construction from
+a stable memoryview, slicing, casting, ``toreadonly()``, and C
+re-exports share the managed buffer that owns the underlying export,
+without a second conflict check.  An ordinary request against a stable
+memoryview behaves as for any read-only memoryview: when the requested
+representation is supported, it succeeds read-only.  A
+``PyBUF_WRITABLE`` request fails exactly as it does today.
+
+A memoryview backed by an ordinary export cannot in general be
+upgraded.  Replacing an already-live ordinary acquisition would
+require a gap or additional coordination, so upgrading and delegation
+are deferred (`Future Directions`_); such a memoryview rejects a
+stable request, through the constructor or through
+``PyObject_GetBuffer()``, with plain
+``BufferError``.  In full, when the constructor receives a memoryview:
+
+* with ``access=None``, it shares the existing managed buffer, as
+  today;
+* with ``access="stable-read"``, it succeeds and shares the managed
+  buffer if that buffer already owns a stable export; and
+* with ``access="stable-read"``, it raises plain ``BufferError`` if
+  the existing managed buffer was acquired ordinarily.
+
+``memoryview.release()`` keeps its existing behavior and its existing
+exception: it raises plain ``BufferError`` while C exports from that
+memoryview remain active.  That failure predates this PEP and involves
+no coordination domain, so it is not reclassified as
+``BufferConflictError``.  Slices and casts independently keep the
+shared managed buffer alive, so they do not prevent release of their
+source.  ``memoryview.obj`` continues to name the exporter.
+
+
+``io.BytesIO``
+~~~~~~~~~~~~~~
+
+While an export returned by ``BytesIO.getbuffer()`` exists, ``BytesIO``
+already rejects operations that modify or discard its allocation.  Its
+ordinary views are writable, and several can coexist, so writes through
+one view remain visible through the others.
+
+``getbuffer()`` gains an ``access`` parameter:
+
+.. code-block:: python
+
+   BytesIO.getbuffer(*, access=None)
+
+``access=None`` preserves the ordinary writable view.  With
+``access="stable-read"``, the method returns a read-only stable
+memoryview.
+
+The relevant combinations are:
+
+========================  ================================  ========
+Active access             New operation                     Result
+========================  ================================  ========
+Ordinary writable export  Another ordinary ``getbuffer()``  Succeeds
+Ordinary writable export  Stable acquisition                Conflict
+Stable export             Another stable acquisition        Succeeds
+Stable export             Ordinary ``getbuffer()``          Conflict
+Either kind of export     Stream mutation                   Conflict
+========================  ================================  ========
+
+Conflicting Python operations raise ``BufferConflictError``.  For an
+active stable export this includes ``write()``, ``writelines()``,
+``truncate()``, ``close()``, reinitialization, and an ordinary
+``getbuffer()`` call.  Reads and cursor movement such as ``seek()``
+continue to succeed.  Existing mutation failures during an ordinary
+export also become ``BufferConflictError``; existing
+``except BufferError`` handlers continue to catch them.
+
+``BytesIO`` does not use copy-on-write to permit mutation during an
+export.  Its views are documented as views over the stream's contents,
+so allowing the stream to diverge would change existing semantics.
+Mutation continues to fail while any export exists; for that existing
+case, only the exception type changes.
+
+``BytesIO`` itself remains a non-exporter.  ``getbuffer()`` creates a
+memoryview over a private exporter object whose name and layout remain
+implementation details.  That private exporter understands
+``PyBUF_STABLE_READ`` and coordinates all views of one stream's
+storage in one domain.  Subclasses that inherit or explicitly invoke
+the base ``getbuffer`` implementation retain this behavior.  An
+override remains responsible for its own advertised semantics, like
+any overridden Python method.
+
+
+C Consumer API
+--------------
+
+
+The Stable-Read Request Flag
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The public C API adds one request flag:
+
+.. code-block:: c
+
+   #define PyBUF_STABLE_READ  0x0400
+
+A successful request containing the flag returns a stable export and
+sets ``view->readonly`` to one.  ``inspect.BufferFlags`` gains a
+matching ``STABLE_READ`` member.
+
+The existing buffer contract permits an ordinary request without
+``PyBUF_WRITABLE`` to return either a read-only or writable result,
+with a consistent choice for all consumers.  This PEP treats stable
+requests as a separate request class: they always return read-only;
+the type's choice for ordinary requests is unchanged.
+
+A stable request contains ``PyBUF_STABLE_READ`` plus exactly one valid
+read-only representation request.  The accepted base representations
+are:
+
+* ``PyBUF_SIMPLE``;
+* ``PyBUF_ND``;
+* ``PyBUF_STRIDES``;
+* ``PyBUF_C_CONTIGUOUS``;
+* ``PyBUF_F_CONTIGUOUS``;
+* ``PyBUF_ANY_CONTIGUOUS``; and
+* ``PyBUF_INDIRECT``.
+
+``PyBUF_FORMAT`` may be added to every base representation except
+``PyBUF_SIMPLE``.  No other combination is valid.  In particular:
+
+* ``PyBUF_WRITABLE`` contradicts a stable-read request;
+* a raw component bit without the prerequisite bits in its compound
+  representation is invalid;
+* combining several contiguity representations is invalid; and
+* ``0x0002``, ``0x0200``, negative values, and every unassigned bit
+  are invalid in a stable request.
+
+An invalid stable request raises ``ValueError`` before the exporter is
+called.  Validation is numeric.  The read-only compound aliases
+``PyBUF_CONTIG_RO``, ``PyBUF_STRIDED_RO``, ``PyBUF_RECORDS_RO``, and
+``PyBUF_FULL_RO`` are therefore accepted: each equals an accepted base
+representation, alone or with ``PyBUF_FORMAT``.  A value's meaning in
+another context is likewise irrelevant: the standalone value
+``0x0100`` is invalid because it lacks the other bits in
+``PyBUF_INDIRECT``, even though the same number names ``PyBUF_READ``
+for a different function argument.  Requests without
+``PyBUF_STABLE_READ`` retain their existing validation and dispatch
+behavior.
+
+This PEP assigns one capability flag.  Combining future capability
+flags, and reserving additional flag ranges, require a later proposal.
+
+
+Acquiring a Stable Export
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A C consumer uses the existing acquisition and release functions:
+
+.. code-block:: c
+
+   Py_buffer view;
+   int flags = PyBUF_CONTIG_RO | PyBUF_STABLE_READ;
+   if (PyObject_GetBuffer(obj, &view, flags) < 0) {
+       return -1;
+   }
+
+   Py_BEGIN_ALLOW_THREADS
+   consume_bytes(view.buf, view.len);
+   Py_END_ALLOW_THREADS
+
+   PyBuffer_Release(&view);
+
+``PyObject_GetBuffer()`` and the ``__buffer__`` wrapper synthesized
+for C exporters are the supported paths that accept caller-selected
+request flags.  A request containing a capability flag uses the
+following precedence for semantic failures:
+
+1. CPython validates the complete numeric request; an invalid
+   combination raises ``ValueError``.
+2. CPython checks for buffer support; an object that is not a buffer
+   exporter raises ``TypeError``.
+3. CPython checks the capability mask declared by the exact type
+   (`Declaring Support`_); a valid capability the type never declared
+   raises plain ``BufferError``.
+4. CPython zero-initializes the caller's ``Py_buffer`` and calls
+   ``bf_getbuffer`` with the flags unchanged.  The exporter checks its
+   representation and instance support; a request it cannot satisfy
+   fails with plain ``BufferError``.
+5. The exporter checks its coordination domain; a supported request
+   that conflicts with an active operation fails with
+   ``BufferConflictError``.  (The support and conflict checks may run
+   under one synchronization; see `The Conflict Check`_.)
+
+Unrelated failures encountered while performing a step, such as
+``MemoryError``, are reported as usual.  After callback success,
+CPython checks the postconditions described below.
+
+The gate in step 3 prevents an exporter written before this PEP from
+silently ignoring the new flag and returning an ordinary view.  A
+declaration means that the type understands the request; steps 4 and 5
+decide whether this instance can satisfy it now.
+
+Every successful stable request must set ``view->obj`` to a new
+reference to the exact object passed to the gated call and set
+``view->readonly`` to one.  A success that violates either
+postcondition is C API misuse.  CPython attempts exporter-specific
+cleanup through the original exporter and raises ``SystemError``.
+
+Calling a ``bf_getbuffer`` function pointer directly bypasses the gate
+and is not a supported or portable way to request this guarantee.  A
+Python-defined ``__buffer__`` method cannot make its own type pass the
+gate.  It may, like other Python code, acquire and return a stable
+memoryview from a declared underlying exporter.
+
+
+Errors
+~~~~~~
+
+The C API exposes the new built-in exception as:
+
+.. code-block:: c
+
+   PyAPI_DATA(PyObject *) PyExc_BufferConflictError;
+
+``BufferConflictError`` means that the operation is supported and
+could succeed in a compatible state but is blocked by an incompatible
+operation active now.  During stable acquisition, plain ``BufferError``
+means that the type, representation, or instance does not support
+stable access; it is not a coordination conflict.  A consumer that
+explicitly accepts weaker semantics may then try an ordinary
+acquisition, but it must not weaken ``BufferConflictError`` silently.
+Retrying is allowed but has no progress guarantee.
+
+Python-facing exporter operations use ``BufferConflictError``.  A C
+interface that cannot report Python exceptions uses its documented
+failure convention, but it must still leave protected memory
+unchanged.  Cleanup paths that cannot fail must avoid or defer
+conflicting work; reporting an unraisable exception is not a substitute
+for preserving the guarantee.
+
+
+Using and Releasing the View
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A stable ``Py_buffer`` follows the existing ownership rules.  The
+consumer owns the structure, may make shallow copies of which exactly
+one is released, and must not modify the structure, its metadata
+arrays, or ``view->internal``.  A GC-tracked owner visits
+``view->obj`` from ``tp_traverse`` and releases the export exactly
+once from ``tp_clear`` or ``tp_dealloc``.
+``PyMemoryView_FromBuffer()`` neither transfers nor extends ownership
+of an export, so the owner of a stable ``Py_buffer`` that wraps it
+this way must keep the export live for the wrapper's whole lifetime
+and release it afterward.  Stable exports follow the same interpreter
+and finalization rules as ordinary exports; this PEP adds no
+cross-interpreter policy.
+
+Stable exports add two rules.  Reading protected memory and
+metadata through pointers already obtained from a live stable view
+requires no attached thread state.  This permits plain memory reads
+only; every Python C API call, including acquisition and
+``PyBuffer_Release()``, still requires an attached thread state.
+Consumers must synchronize every handoff of the view between threads,
+and every access through the view must happen-before the call that
+releases it.  The exporter's conflict check orders exporter-side
+operations, not consumer reads (`Memory Ordering`_).
+
+
+Exporter API and Requirements
+-----------------------------
+
+This section is written for the author of a declaring type: how to
+declare the capability, what the audit behind a declaration must
+cover, and how the exporter's own code must behave once it
+participates in conflict checks.
+
+
+Declaring Support
+~~~~~~~~~~~~~~~~~
+
+Support is declared, never inferred.  An exact heap type declares the
+capability with a typed :pep:`820` slot, directly or through
+``Py_slot_subslots``:
+
+.. code-block:: c
+
+   PySlot_UINT64(Py_bf_buffer_capabilities, PyBUF_STABLE_READ)
+
+CPython copies the mask into type-owned storage during type creation,
+so the caller may then free the slot array as permitted by :pep:`820`.
+
+A declaration is valid only when:
+
+* the mask is nonzero and contains only defined capability flags;
+* the defining type requests ``Py_TPFLAGS_IMMUTABLETYPE`` as part of
+  its definition, and every base in its MRO is already immutable;
+* the metaclass is exactly ``type``; and
+* normal slot inheritance produces a native ``bf_getbuffer`` function,
+  not the wrapper synthesized for a Python-defined ``__buffer__``.
+
+Violation fails type creation with ``TypeError``.  The immutability
+and exact-metaclass rules prevent later Python-level replacement of
+audited paths.  Making the type immutable after creation would be too
+late, because the capability is cached during creation; that is why
+the flag must be part of the definition.  A base made immutable before
+the defining type is created may qualify.
+
+The declaration is not inherited.  Each exact subclass starts with no
+capabilities and must make its own declaration after its own audit.  A
+Python-defined subclass cannot opt in.  Thus a ``bytes`` subclass does
+not inherit the capability of exact ``bytes``.
+
+Unchecked C-level type mutation, including replacement of slot pointers
+without the supported type APIs, invalidates the guarantee and is API
+misuse.
+
+This PEP defines no public declaration path for static types.
+CPython's own static exporters use an internal equivalent.  Public
+static-type registration and capability introspection are deferred
+(`Future Directions`_).
+
+
+Exporter Audit
+~~~~~~~~~~~~~~
+
+Declaring support asserts an audit of every supported interface the
+exact type provides for reaching the memory or metadata, including
+private interfaces.  The author must examine:
+
+* Python methods that write, resize, close, rebind, or expose aliases;
+* ordinary and stable buffer acquisitions;
+* public and private C functions and macros that return pointers or
+  mutate storage;
+* raw write-capable pointers and their observable acquisition and
+  separate release points;
+* other objects or exporter instances that share the allocation;
+* callbacks, reentrant calls, and code executed outside the exporter's
+  control;
+* storage writable by another process, a device, or the kernel; and
+* GC clearing, finalization, and deallocation.
+
+A type is ineligible if any supported path can perform a conflicting
+operation without using the domain state, or if a path can neither
+fail nor defer when a conflict exists.  In particular, an interface
+that grants write-capable access without observable acquisition and a
+separate, observable release point makes the type ineligible.  A
+pointer that remains valid for the life of the object does not qualify:
+an earlier pointer would remain writable throughout any later stable
+export.  This PEP does not permit a declaration based on permanently
+disabling stable reads after such a pointer is exposed.  Memory reached
+only by violating an interface contract is outside the audit.
+
+
+The Conflict Check
+~~~~~~~~~~~~~~~~~~
+
+This section specifies how an exporter makes the accept-or-refuse
+decision that the conflict rules describe.  Each coordinated operation
+has one decision point protected by the domain's synchronization.  At
+that point the exporter determines whether it supports the requested
+representation, classifies the operation, checks the active domain
+state, and either records the operation or refuses it.  A support
+failure takes precedence over a conflict, so the consumer sees plain
+``BufferError`` for a request the exporter could never satisfy.  When
+support depends on mutable layout state, the support check may run
+while holding the same synchronization.
+
+For a long-lived stable or possibly writable export, the exporter:
+
+1. takes the domain synchronization;
+2. validates exporter-specific representation support and classifies
+   the request;
+3. checks the active operations and fails if one conflicts;
+4. publishes an active export record before releasing the
+   synchronization;
+5. constructs the view after publishing the record; and
+6. on failure, removes the record before returning; on success, leaves
+   it active until ``bf_releasebuffer`` returns.
+
+The decision and publication of the record form one atomic state
+transition.  A stable-export record excludes operations that could
+disturb its view during construction.  A possibly writable record
+excludes stable acquisition but adds no coordination among ordinary
+operations; existing exporter synchronization remains responsible for
+safe construction of an ordinary view.  In either case, no operation
+that conflicts with the published record can pass the domain check.
+
+A bounded internal operation, such as a single write, may instead hold
+the synchronization for its whole duration.  Otherwise it publishes a
+bounded-operation record, performs the work, and removes the record
+when the work is complete.
+
+An exporter must not hold the domain synchronization for the lifetime
+of an export, while waiting for another thread, or while executing
+code outside its control.  A stable request may briefly wait to
+acquire this synchronization.  Once it observes a conflicting active
+operation, it fails; it does not wait for that operation to finish.
+
+
+Memory Ordering
+~~~~~~~~~~~~~~~
+
+Excluding overlap in wall-clock time is not enough on its own; the
+domain synchronization must also order incompatible operations in the
+C memory model.  When one incompatible operation follows another,
+accesses by the earlier operation to protected memory and metadata
+happen-before accesses by the later operation.
+
+Completing a bounded operation or removing a long-lived export record
+must publish prior accesses with release semantics.  A later
+incompatible conflict check observes completion with acquire
+semantics.  A mutex provides this ordering; a lock-free implementation
+must provide equivalent ordering explicitly.
+
+Compatible operations receive no ordering from this mechanism, and it
+promises nothing about unrelated consumer memory.  In particular,
+consumers still synchronize their own handoffs and releases
+(`Using and Releasing the View`_).
+
+
+Exporter Behavior
+~~~~~~~~~~~~~~~~~
+
+An audited exporter classifies each buffer request before granting it:
+
+* a stable request is either immutable, requiring no per-export state,
+  or coordinated through a long-lived stable-export record;
+* an ordinary request known to return read-only needs no record; and
+* every other ordinary request is treated as a possibly writable
+  export.
+
+Even an exporter with immutable storage must meet the stable-export
+postconditions (`Acquiring a Stable Export`_): it sets ``view->obj``
+to a new reference to itself and sets ``view->readonly`` to one.  It
+may omit conflict bookkeeping and ``bf_releasebuffer`` when no export
+requires cleanup.
+
+For every coordinated or possibly writable export, ``bf_getbuffer``:
+
+* follows the conflict-check sequence (`The Conflict Check`_);
+* returns ``-1`` without a live record if support or construction
+  fails;
+* meets the postconditions: ``view->obj`` is a new reference to the
+  exporter itself and, for stable requests, ``view->readonly`` is one;
+* satisfies the requested representation;
+* stores any per-export state somewhere that survives a shallow
+  ``Py_buffer`` copy and does not depend on the structure's address;
+  ``view->internal`` is available for this purpose; and
+* does not re-enter the exporter or publish an unfinished view.
+
+Writes, storage changes, and interfaces that grant write-capable
+access all use the same domain state.  A Python operation fails with
+``BufferConflictError`` before touching protected memory.  An
+operation that first switches to private storage and cannot affect a
+live stable view needs no conflict check for the later private write.
+
+Each coordinated stable or possibly writable export has a
+``bf_releasebuffer`` callback.  The callback removes the record
+exactly once, publishes completion with the required ordering
+(`Memory Ordering`_), and performs exporter cleanup.  It must not
+decrement or modify ``view->obj``, set an exception, or disturb an
+exception already active; ``PyBuffer_Release()`` decrements the
+reference afterward.
+
+``bf_getbuffer`` and ``bf_releasebuffer`` run with an attached thread
+state.  Compatible calls may execute concurrently in a free-threaded
+build, so the callbacks and domain bookkeeping must be thread-safe.
+
+Cleanup that cannot fail must not invalidate an active export.  The
+strong reference in ``view->obj`` normally keeps the exporter alive.
+If an exporter retains other Python objects for an active export, its
+``tp_traverse`` visits those references.  No earlier cleanup path may
+free protected storage.
+
+
+Initially Supported Types
+-------------------------
+
+The initial set is deliberately small: exact ``bytes``; exact
+``memoryview``, for propagation; and the private exporter used by
+``io.BytesIO.getbuffer()``.  This includes immutable storage and one
+mutable exporter whose access paths can be audited completely.
+
+Exact ``bytes`` requires no conflict bookkeeping.  To close its
+existing construction-time exception, this PEP narrows the documented
+mutation allowance for objects created by
+``PyBytes_FromStringAndSize(NULL, size)`` and equivalent APIs: after
+the first successful buffer acquisition, a retained construction
+pointer must not be used to modify the object.  The acquisition ends
+the construction pointer's write permission even if the pointer was
+obtained earlier.  Concurrent publish-then-write remains invalid under
+the existing threading rules.  Code using ``PyBytesWriter`` completes
+construction before the ``bytes`` object is returned and is
+unaffected.
+
+``bytearray``, ``array.array``, and ``mmap.mmap`` are excluded
+initially.  The first two expose mutation or raw-pointer paths that do
+not currently participate in a conflict check.  An ``mmap`` may have
+writers outside the process's control.
+
+
+Backwards Compatibility
+=======================
+
+The new flag, exception, and slot ID are public CPython C API in
+Python 3.16.  They are hidden when ``Py_LIMITED_API`` is defined and
+are not initially part of the Stable ABI.  A compatibility shim cannot
+provide the guarantee for an arbitrary older exporter.  Adding these
+APIs to the Stable ABI is deferred until implementation and
+third-party experience establish that the declaration and error model
+can remain fixed.
+
+The signatures of ``PyObject_GetBuffer()``, ``PyBuffer_Release()``,
+``bf_getbuffer``, and ``bf_releasebuffer`` and the layout of
+``Py_buffer`` are unchanged.  Every existing ``PyBUF_*`` value is
+unchanged.  Requests without ``PyBUF_STABLE_READ`` follow the current
+validation and dispatch path after a capability-bit test.
+
+Today, acquisition paths generally forward undocumented high bits to
+``bf_getbuffer``.  A private consumer and exporter pair that passes
+the new bit value without using this PEP's declaration will instead
+receive ``BufferError``.  Passing undocumented bits was never
+supported, but it is the one behavioral change for a type that does
+not opt in.
+
+Existing exporters declare no capabilities, and existing consumers do
+not pass the new flag.  A declaration extends an existing
+``bf_getbuffer``; it does not replace ordinary buffer support.
+``PyObject_CheckBuffer()`` retains its current meaning and says
+nothing about stable requests.
+
+An opted-in exporter may newly raise ``BufferConflictError`` from an
+ordinary acquisition or mutation while a stable export is active.
+``BytesIO`` also changes existing live-export mutation failures from
+exact ``BufferError`` to the subclass.  Normal ``except BufferError``
+and ``PyErr_ExceptionMatches(PyExc_BufferError)`` handling is
+preserved, but exact-type comparisons observe a change.
+
+Opting in can also change ``view->obj`` for ordinary possibly writable
+exports that previously redirected it to an underlying owner.  Stable
+exports always name the object passed to acquisition.  Each exporter
+migration must evaluate observable owner and release-callback changes
+under :pep:`387`.
+
+For exact ``bytes``, writing through a construction pointer after a
+successful buffer acquisition becomes explicit API misuse.  Code that
+finishes initialization before exposing a buffer is unchanged.
+
+
+Security Implications
+=====================
+
+Consumers trust the exporter's declaration and audit in addition to
+the validity of the ``Py_buffer`` fields.  They remain responsible for
+layout, bounds, alignment, and element validation.  A faulty
+declaration can create native data races and must be treated as a
+serious C API bug.
+
+A leaked stable export, including one retained by a derived
+memoryview, prevents later conflicting operations.  This
+denial-of-service risk is comparable to existing export leaks that
+prevent resizing.
+
+
+Performance
+===========
+
+An ordinary request adds one predictable test for capability bits.
+Types that do not opt in need no exporter-side state.  A stable
+request adds numeric validation, one read of the exact type's
+capability mask, and zero-initialization of the output structure.
+
+An opted-in mutable exporter adds bookkeeping to writes, storage
+changes, and possibly writable acquisitions.  Ordinary reads need no
+record.  Shared domains may contend on their synchronization.  These
+are expectations, not measurements; the implementation must benchmark
+ordinary and stable acquisition.
+
+
+How to Teach This
+=================
+
+Python documentation presents ``access="stable-read"``, the read-only
+result, and the symmetric ``BufferConflictError`` rule.  C consumer
+documentation covers the request flag, error precedence, and detached
+reads.  Exporter documentation uses the checklist in `Exporter Audit`_
+to explain the audit asserted by a declaration.
+
+
+Implementation and Test Plan
+============================
+
+No implementation exists yet.  Acceptance requires a CPython
+implementation of:
+
+* flag validation and the exact-type capability gate on both supported
+  acquisition paths;
+* :pep:`820` declaration validation;
+* exact ``bytes`` support and its revised construction contract;
+* stable managed-buffer propagation in ``memoryview``; and
+* the ``BytesIO`` private exporter's conflict state.
+
+Before acceptance, a small out-of-tree heap exporter should exercise
+the public declaration API.  This validates that the PEP describes an
+API usable outside CPython rather than only its built-in special
+cases.
+
+Tests run on GIL-enabled and free-threaded builds and cover the
+acquisition matrix, error precedence, representation validation,
+lifetime and cross-thread handoff of derived views and C re-exports,
+and the exact ``bytes`` construction endpoint.  Four cases deserve
+emphasis:
+
+* ThreadSanitizer verification of a stable read concurrent with
+  attempted writes;
+* rollback after a failure that follows publication of an active
+  record;
+* malformed postconditions from a test exporter; and
+* rejection of custom-metaclass, mutable-type, inherited, and
+  synthesized slot declarations.
+
+CPython's initial mutable exporter and any that follow may share a
+private helper for domain state.  A public coordination helper is not
+part of this PEP.
+
+
+Rationale and Rejected Ideas
+============================
+
+Only the exporter can coordinate every supported path to its storage.
+A consumer cannot discover an arbitrary exporter lock or make all
+aliases use a new one, and even an unsynchronized copy can race.  The
+guarantee lasts until release because native code may retain the
+pointer.
+
+Support is exact-type and opt-in because it represents an access-path
+audit, not a property implied by inheritance.  Conflicts fail instead
+of waiting because a generic wait could introduce lock-ordering and
+deadlock risks outside the protocol's control.
+
+**Permanently disable stable reads after a raw pointer escapes.**  An
+exporter could record the escape and reject every later stable request
+for that domain.  This requires every escape path to be observable,
+adds irreversible domain state, and makes support depend on unrelated
+earlier access.  This PEP instead requires a separate, observable
+release point.
+
+**Rely on an undeclared flag.**  Existing exporters generally ignore
+unknown request bits.  Without the exact-type gate, an older exporter
+could return an ordinary view to a consumer that believes it received
+a stable one.
+
+**Add ``PyObject_GetStableBuffer()``.**  A separate entry point would
+still need the declaration, gate, error model, and exporter
+coordination.  It would also require wrappers and code generators to
+support a parallel acquisition API.  A request flag uses the existing
+path and existing flag arguments.
+
+**Infer stability from a read-only result.**  A read-only result
+restricts only that view.  It supplies no information about writes
+through other aliases or exporter methods, so inference would recreate
+the problem this PEP is intended to solve.
+
+**Spell the Python request as a boolean or a flags value.**  A boolean
+does not extend naturally to additional access modes.  A C flags value
+would expose request numerology and imply support for arbitrary flag
+combinations.  A string-valued modal parameter can add modes without
+changing either signature.
+
+
+Future Directions
+=================
+
+Possible follow-up work includes:
+
+* public declarations for static types and capability introspection;
+* delegation and forwarding by wrappers, including forwarding stable
+  requests through ordinary memoryviews, when a safe protocol can be
+  defined;
+* additional capabilities, including exclusive writes;
+* C convenience constructors, including a flags-taking
+  ``PyMemoryView_FromObject()`` variant and constructors that take
+  ownership of a C-held stable export; and
+* audits and opt-in for more built-in and third-party exporters.
+
+
+Acknowledgements
+================
+
+Samuel Eisenhandler started the earlier, broader `safer-mutability
+discussion
+<https://discuss.python.org/t/pep-draft-safer-mutability-semantics-for-the-buffer-protocol/42346>`__.
+Alex Gaynor articulated the native-language problem.
+
+Sebastian Berg, Petr Viktorin, Antoine Pitrou, David Woods, Sam Gross,
+and other participants in the 2023--2024 discussion clarified the
+compatibility and free-threading constraints.
+
+Petr, Antoine, David, Bruno Kolenbrander, Emma Smith, Eric Snow, and
+Hood Chatham also provided feedback and contributions that helped
+shape this proposal.
+
+
+Copyright
+=========
+
+This document is placed in the public domain or under the
+CC0-1.0-Universal license, whichever is more permissive.
