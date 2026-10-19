@@ -712,7 +712,7 @@ before making the type available for use.
 The registration function returns ``0`` on success, or ``-1`` with an
 exception set on failure.  A failed call leaves any existing declaration
 unchanged.  With either path, CPython records the declaration only after
-all checks and any required allocations have succeeded.
+all declaration checks have succeeded.
 
 CPython's built-in exporters use equivalent internal initialization.
 
@@ -733,11 +733,8 @@ support cannot account for writable access granted earlier.  Declaring
 support without meeting the requirements, or later replacing audited
 interfaces through unchecked C-level mutation, is C API misuse.
 
-CPython stores declarations in a process-wide internal table keyed by
-exact type identity.  The table does not keep types alive.  When a heap
-type is destroyed, its entry is removed before its memory can be reused.
-Lookup, registration, and removal are synchronized, and no table lock
-is held while calling an exporter.
+CPython stores buffer capabilities in a private field on each type
+object.  Registration and capability checks are thread-safe.
 
 There is no Python-level declaration API.  Python-defined :pep:`688`
 buffer slots remain ineligible.
@@ -860,11 +857,11 @@ Performance
 ===========
 
 Ordinary acquisition adds a predictable request-flag test.  Stable
-acquisition adds request validation, a capability lookup, and output
-initialization.  Mutable exporters add bookkeeping to writes, storage
-changes, and possibly writable exports; ordinary reads need no conflict
-record.  Shared domains may contend.  These are expectations, not
-measurements; the implementation must benchmark both acquisition paths.
+acquisition adds request validation, a check of the exact type's
+capabilities, and output initialization.  Mutable exporters add bookkeeping
+to writes, storage changes, and possibly writable exports; ordinary reads
+need no conflict record.  Shared domains may contend.  These are expectations,
+not measurements; the implementation must benchmark both acquisition paths.
 Benchmarks must also compare concurrent reads through views sharing one
 managed buffer with reads through independent acquisitions from the
 same exporter, to capture contention in memoryview lifetime bookkeeping.
@@ -907,9 +904,10 @@ Tests on GIL-enabled and free-threaded builds must cover:
 * flag and slot validation, registration errors without partial state
   changes, and rejection of unready or mutable types, mutable bases, custom
   metaclasses, and slots wrapping Python-defined ``__buffer__`` methods;
-* non-inheritance of declarations, repeated registration after either
-  declaration path and during module initialization, cleanup when a heap
-  type is destroyed, and rejection of attempts to remove a declaration;
+* non-inheritance of declarations, repeated and concurrent registration
+  after either declaration path and during module initialization,
+  declarations shared across interpreters, collection of declared heap
+  types, and rejection of attempts to remove a declaration;
 * stable reads concurrent with attempted writes under ThreadSanitizer;
 * conflict detection while recorded operations modify layout outside
   domain synchronization;
