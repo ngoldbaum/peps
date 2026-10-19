@@ -14,18 +14,17 @@ Post-History: Pending
 Abstract
 ========
 
-The buffer protocol keeps exported storage alive, but a read-only
-view does not prevent writes through an alias.  This PEP adds an
-optional stable-read request: the exporter guarantees that the view's
-contents, layout, and backing storage remain unchanged until release.
-Multiple stable reads may coexist; conflicting writes and write-capable
-exports fail with ``BufferConflictError``.
-
-Python consumers request ``access="stable-read"``; C consumers use
-``PyBUF_STABLE_READ``.  CPython checks that the exact exporter type has
-declared support.  Each declaring exporter is responsible for
-coordinating its supported interfaces.  Native consumers may read a
-stable export without copying, even with their thread state detached.
+Python’s buffer protocol lets different parts of a program share data without copying it.
+Code requests a view of the data, specifying the access it needs.
+A view with read-only access prevents changes through that view, but other code
+can still change the same data.
+This makes it difficult to guarantee that reads of shared data are safe without
+auditing every path in an application that can modify shared data.
+A library cannot rely on a read-only view alone to guarantee that the data remains unchanged while it is being read.
+The problems are particularly acute when multiple threads are involved.
+This PEP introduces an optional way to request a stable, read-only view from objects that support it.
+The data remains unchanged until the view is released, and operations that would change it fail while the view is active.
+Python extensions can use this guarantee to read shared data without making a protective copy, even while other threads run.
 
 
 Motivation
@@ -51,7 +50,7 @@ same-size writes through ``writer``.
 
 In a free-threaded build, reads and writes through different views can
 race at the C level.  The `memoryview thread-safety guarantees
-<https://docs.python.org/3/library/threadsafety.html#thread-safety-memoryview>`__
+<https://docs.python.org/3/builtins/threadsafety.html#thread-safety-memoryview>`__
 require external synchronization around mutable backing storage.
 GIL-enabled builds face the same problem when native code detaches its
 thread state, as ``hashlib`` and compression modules do while reading
@@ -334,7 +333,10 @@ Previously exported storage may be reused once exclusive ownership
 has been safely re-established under the API's existing rules.  In a
 free-threaded build, a reference count of one alone does not establish
 exclusive ownership.  Nor does that count grant permission to mutate
-arbitrary bytes objects.
+arbitrary bytes objects.  Existing restrictions on mutating singletons
+and bytes with cached hashes still apply.  A successful
+``_PyBytes_Resize()`` does not itself establish exclusive ownership:
+a same-size request can return the original object unchanged.
 
 ``PyBytesWriter`` already completes construction before returning the
 object, so it is unaffected.
@@ -349,7 +351,8 @@ underlying export alive and records whether its acquisition was stable.
 Construction from a stable memoryview, slicing, casting,
 ``toreadonly()``, and C re-exports share this owner without repeating
 the original exporter's conflict check.  The underlying export remains
-active until every view and C export has finished using it.
+active until every view, C export, and in-flight memoryview operation
+has finished using it.
 
 When constructing a memoryview from another memoryview, ``access``
 determines whether an ordinary acquisition is acceptable:
@@ -381,15 +384,20 @@ Here, ``tail`` keeps the stable export active:
 ``memoryview.release()`` still raises plain ``BufferError`` while any
 C export from that particular memoryview remains active.
 
+An already-started memoryview operation may keep the underlying export
+active after ``memoryview.release()`` returns, even when no dependent
+views or C exports remain.  The exporter must continue to reject
+conflicts until that operation no longer needs the export.
+
 For views that own an export, ``memoryview.obj`` continues to name the
 object from which the export was acquired.  For ``BytesIO``, this is
 the private exporter described below.
 
-Creating dependent views or C re-exports, including released-state
-checks and owner-count updates, must be synchronized with release.
-The last release must not end the underlying export while another
-thread registers access.  GC clearing must also defer release while
-dependent views or C re-exports still need the export.
+Starting a memoryview operation or creating a dependent view or C
+re-export, including released-state checks and owner-count updates,
+must be synchronized with release.  The last release and GC clearing
+must not end the underlying export while a dependent view, C export,
+or in-flight operation still needs it.
 
 
 ``io.BytesIO``
@@ -854,9 +862,12 @@ Performance
 Ordinary acquisition adds a predictable request-flag test.  Stable
 acquisition adds request validation, a capability lookup, and output
 initialization.  Mutable exporters add bookkeeping to writes, storage
-changes, and possibly writable exports; ordinary reads need no record.
-Shared domains may contend.  These are expectations, not measurements;
-the implementation must benchmark both acquisition paths.
+changes, and possibly writable exports; ordinary reads need no conflict
+record.  Shared domains may contend.  These are expectations, not
+measurements; the implementation must benchmark both acquisition paths.
+Benchmarks must also compare concurrent reads through views sharing one
+managed buffer with reads through independent acquisitions from the
+same exporter, to capture contention in memoryview lifetime bookkeeping.
 
 
 How to Teach This
@@ -879,6 +890,13 @@ public headers must keep the new names out of Limited API builds and
 the Stable ABI.  ``_pyio.BytesIO.getbuffer()`` will accept ``access``
 and report unsupported stable access with plain ``BufferError``.
 
+The implementation must not inherently conflict with the memoryview lifetime
+fixes tracked in `python/cpython#127716
+<https://github.com/python/cpython/issues/127716>`__, including keeping
+exports alive during in-flight operations.  ``BytesIO`` must preserve
+its existing per-export ownership of the backing bytes when adding
+access-mode bookkeeping, so exports remain valid after close.
+
 Purpose-built static and heap test exporters will exercise both
 declaration paths, heap-type configuration followed by freezing, work
 outside domain locks, and coordinated pointer escape.  Out-of-tree
@@ -895,14 +913,24 @@ Tests on GIL-enabled and free-threaded builds must cover:
 * stable reads concurrent with attempted writes under ThreadSanitizer;
 * conflict detection while recorded operations modify layout outside
   domain synchronization;
-* acquisition rollback and conflict checks concurrent with record removal;
+* acquisition rollback, including allocation failures after adding an
+  export record, and conflict checks concurrent with record removal;
 * metadata lifetime after shallow copies, dependent views, C re-exports,
   synchronized handoffs, and GC cycles with differing clearing orders;
+* stability propagation through C- and F-contiguous casts, including
+  ``cast(order="F")`` and flattening F-contiguous views;
+* release concurrent with in-flight memoryview operations, with conflict
+  protection retained until those operations no longer need the export;
+* ``BytesIO`` views, dependent views, and C re-exports remaining valid
+  after close, with new acquisitions refused;
 * coordinated pointer escape and subsequent permanent refusal;
 * early failures, base-class buffer wrappers, and recoverable malformed
-  postconditions; and
+  postconditions;
 * CPython's bytes construction and copy-on-write paths preserving live
-  exports, and ``BytesIO`` reinitialization failing without changing state.
+  exports, including same-size resize requests and cached hashes; and
+* ``BytesIO`` reinitialization conflicts leaving stream state unchanged,
+  and resize allocation failures preserving backing storage and logical
+  length.
 
 
 Rationale and Deferred Work
