@@ -809,10 +809,14 @@ exporter.
 Backwards Compatibility
 =======================
 
-The new flag, exception, and type slot are public CPython C API in
-Python 3.16, initially unavailable under ``Py_LIMITED_API`` and outside
-the Stable ABI.  Stable ABI inclusion awaits third-party experience;
-a shim cannot supply the guarantee for arbitrary older exporters.
+This draft proposes adding ``PyBUF_STABLE_READ``,
+``PyExc_BufferConflictError``, and ``Py_bf_buffer_capabilities`` to the
+Limited API and Stable ABI in Python 3.16; see `Limited API Inclusion`_.
+``PyUnstable_Type_RegisterBufferCapabilities()`` remains in the
+Unstable C API. Extensions using the new mode must require Python 3.16 or
+later.
+
+
 
 Existing buffer function signatures, the ``Py_buffer`` layout, and
 ``PyBUF_*`` values are unchanged.  Existing exporters declare no
@@ -880,12 +884,13 @@ explicitly separate from the exporter's synchronization responsibilities.
 Implementation and Test Plan
 ============================
 
-No implementation exists yet.  The prototype will need the acquisition
-checks, both declaration APIs, exact ``bytes`` support, memoryview
-propagation, and ``BytesIO`` coordination.  The slot generator and
-public headers must keep the new names out of Limited API builds and
-the Stable ABI.  ``_pyio.BytesIO.getbuffer()`` will accept ``access``
-and report unsupported stable access with plain ``BufferError``.
+The prototype implements the public API and checked acquisition.
+Exact ``bytes`` support, memoryview propagation, and ``BytesIO``
+coordination remain to be implemented.  Following the current proposal,
+the public headers expose the flag, exception, and type slot when
+targeting Limited API 3.16 or later; the registration function remains
+outside the Limited API.  ``_pyio.BytesIO.getbuffer()`` will accept
+``access`` and report unsupported stable access with plain ``BufferError``.
 
 The implementation must not inherently conflict with the memoryview lifetime
 fixes tracked in `python/cpython#127716
@@ -901,6 +906,9 @@ exporters will check that the public APIs suffice.
 
 Tests on GIL-enabled and free-threaded builds must cover:
 
+* stable acquisition and exporter declarations using only Limited API
+  3.16, including access to the conflict exception, and version guards
+  that keep the new names unavailable to older Limited API targets;
 * flag and slot validation, registration errors without partial state
   changes, and rejection of unready or mutable types, mutable bases, custom
   metaclasses, and slots wrapping Python-defined ``__buffer__`` methods;
@@ -958,6 +966,23 @@ Deferred work includes capability or export-mode introspection,
 exclusive writes, safe wrapper delegation and memoryview upgrades,
 C convenience or ownership-taking constructors, and more exporter
 audits.  Combining future capability flags requires a later proposal.
+
+
+Open Questions
+==============
+
+Limited API Inclusion
+---------------------
+
+Should ``PyBUF_STABLE_READ`` be included in the Limited API starting
+with Python 3.16, or should inclusion wait for third-party experience?
+
+Including the flag alongside the exception and declaration slot lets
+Limited API extensions both consume and export stable buffers using
+the existing buffer structures and functions.  Deferring inclusion
+would allow more experience with the interface before making a Stable
+ABI commitment.  This draft and the prototype currently include all
+three, while keeping the registration function Unstable.
 
 
 Acknowledgements
