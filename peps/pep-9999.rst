@@ -212,7 +212,8 @@ read-only aliases are accepted by numeric equality; for example,
 No other numeric combination is valid.  In particular, a stable request
 cannot contain ``PyBUF_WRITABLE``, negative values, unknown bits,
 incomplete compound flags, or combined contiguity flags.  These checks
-are stricter than some exporters' ordinary request validation.
+enforce the documented request forms even when an exporter accepts
+additional combinations for ordinary requests.
 Requests without ``PyBUF_STABLE_READ`` retain their existing validation
 and dispatch behavior.
 
@@ -664,6 +665,9 @@ its buffer callback meets `Exporter Requirements`_.
 
 The declaration applies only to that exact type.  A subclass needs its
 own audit and declaration, even if it inherits the buffer callback.
+Declaring support asserts that the resolved callbacks meet the stable-read
+requirements for instances of that type, including when those callbacks
+are inherited.
 Only the code responsible for initializing and auditing the type may
 make the declaration.  It must finish configuring the type and make
 the initial declaration before exposing the type for use or creating
@@ -671,12 +675,18 @@ instances or subclasses.
 
 Both declaration paths below require:
 
-* ``PyType_Ready()`` has completed successfully;
 * the type and every base in its MRO have
   ``Py_TPFLAGS_IMMUTABLETYPE`` set;
-* the metaclass is exactly ``type``; and
+* the metaclass is exactly ``type``;
+* the type is not ``types.ModuleType`` or one of its subclasses; and
 * the resolved ``bf_getbuffer`` is non-NULL and native, rather than
   the slot wrapper for a Python-defined ``__buffer__``.
+
+Immutability keeps the audited callbacks and bases from changing through
+Python code.  It also prevents instances from changing type through
+``__class__`` assignment.  Module subtypes are excluded because they are
+an exception to that assignment restriction even when immutable; changing
+an exporter's type could redirect release to a different callback.
 
 Unmet type requirements raise ``TypeError``.  A capability mask other
 than ``PyBUF_STABLE_READ`` raises ``ValueError``.
@@ -686,15 +696,18 @@ Choosing a Declaration Path
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 For a heap type that is immutable at creation, add this :pep:`820` slot
-to its type specification:
+to the ``PySlot`` array passed to ``PyType_FromSlots()``:
 
 .. code-block:: c
 
-   PySlot_UINT64(Py_bf_buffer_capabilities, PyBUF_STABLE_READ)
+   PySlot_UINT64(Py_tp_buffer_capabilities, PyBUF_STABLE_READ)
 
 The public slot carries a ``uint64_t`` value and can appear directly or
-through ``Py_slot_subslots``, following :pep:`820`.  An invalid
-declaration causes type creation to fail.
+through ``Py_slot_subslots``, following :pep:`820`.  CPython validates the
+declaration during type readiness; an invalid declaration causes type
+creation to fail.  The slot requires ``PySlot``.  Using it through
+``PyType_Spec`` or a ``PyType_Slot`` array included with ``Py_tp_slots``
+raises ``SystemError``.
 
 For a static type, or a heap type that needs further configuration
 after creation, use this new Unstable C API function:
@@ -704,15 +717,16 @@ after creation, use this new Unstable C API function:
    int PyUnstable_Type_RegisterBufferCapabilities(
        PyTypeObject *type, uint64_t capabilities);
 
-``PyType_Ready()`` makes a static type immutable.  A heap type using
+``PyType_Ready()`` must have completed successfully before registration;
+it also makes a static type immutable.  A heap type using
 this path is created without the capability slot, configured, and then
 made immutable with ``PyType_Freeze()``.  It then registers support
 before making the type available for use.
 
 The registration function returns ``0`` on success, or ``-1`` with an
 exception set on failure.  A failed call leaves any existing declaration
-unchanged.  With either path, CPython records the declaration only after
-all declaration checks have succeeded.
+unchanged.  Neither declaration path succeeds unless all declaration
+checks pass.
 
 CPython's built-in exporters use equivalent internal initialization.
 
@@ -775,12 +789,13 @@ It relies on the exporter's audit and synchronization for the actual
 stability guarantee.
 
 If either field has the wrong value, CPython rejects the result with
-``SystemError`` after cleaning it up.  It calls the original exporter's
-``bf_releasebuffer``, if present, decrements the returned owner
-reference if non-NULL, and clears the output structure.  It never
-chooses a release callback from the unexpected owner.  This recovery
-requires releasable export state and either a NULL owner or a valid
-owned reference; it cannot repair arbitrary C API misuse.
+``SystemError`` after cleaning it up.  For a non-NULL owner, it calls
+``PyBuffer_Release()`` using that owner's normal release path, even if
+the owner is not the original exporter.  For a NULL owner, it calls the
+original exporter's ``bf_releasebuffer``, if present.  It then clears
+the output structure.  This recovery requires otherwise releasable export
+state and either a NULL owner or a valid owned reference; it cannot
+repair arbitrary C API misuse.
 
 A conforming failed acquisition leaves ``view->obj`` NULL and no
 record, reference, or other resource for the consumer to release.
@@ -803,14 +818,16 @@ A direct C call to ``bf_getbuffer`` bypasses these checks and is not a
 supported or portable way to request stability.  A Python-defined
 ``__buffer__`` cannot pass the checks for its own type, but it may
 acquire and return a stable memoryview from a declared underlying
-exporter.
+exporter, including during an ordinary buffer acquisition.  An ordinary
+acquisition does not provide the consumer with a checked stability
+guarantee, even if an underlying stable view protects the returned storage.
 
 
 Backwards Compatibility
 =======================
 
 This draft proposes adding ``PyBUF_STABLE_READ``,
-``PyExc_BufferConflictError``, and ``Py_bf_buffer_capabilities`` to the
+``PyExc_BufferConflictError``, and ``Py_tp_buffer_capabilities`` to the
 Limited API and Stable ABI in Python 3.16; see `Limited API Inclusion`_.
 ``PyUnstable_Type_RegisterBufferCapabilities()`` remains in the
 Unstable C API. Extensions using the new mode must require Python 3.16 or
@@ -911,7 +928,8 @@ Tests on GIL-enabled and free-threaded builds must cover:
   that keep the new names unavailable to older Limited API targets;
 * flag and slot validation, registration errors without partial state
   changes, and rejection of unready or mutable types, mutable bases, custom
-  metaclasses, and slots wrapping Python-defined ``__buffer__`` methods;
+  metaclasses, module subtypes, legacy capability slots, and slots wrapping
+  Python-defined ``__buffer__`` methods;
 * non-inheritance of declarations, repeated and concurrent registration
   after either declaration path and during module initialization,
   declarations shared across interpreters, collection of declared heap
@@ -919,6 +937,8 @@ Tests on GIL-enabled and free-threaded builds must cover:
 * stable reads concurrent with attempted writes under ThreadSanitizer;
 * conflict detection while recorded operations modify layout outside
   domain synchronization;
+* rejection of malformed successful exports, including release through
+  the returned owner for delegated exports;
 * acquisition rollback, including allocation failures after adding an
   export record, and conflict checks concurrent with record removal;
 * metadata lifetime after shallow copies, dependent views, C re-exports,
