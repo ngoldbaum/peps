@@ -321,26 +321,30 @@ its storage.
 ~~~~~~~~~
 
 Exact ``bytes`` can provide stable reads without tracking conflicts.
-Its construction APIs still need an ownership rule, because
-``PyBytes_FromStringAndSize(NULL, size)`` and related APIs let C code
-fill in the bytes before sharing them.
+This relies on the existing immutability contract: mutating bytes while
+they are shared is a bug, whether or not a stable export exists.
+Construction APIs such as ``PyBytes_FromStringAndSize(NULL, size)`` allow
+C code to fill private storage before sharing the completed object.
 
-Writes through these APIs require exclusive ownership, with no live
-bytes exports or other readers.  This includes writes through
-construction pointers obtained earlier.  All construction writes must
-happen-before publication to another thread or buffer acquisition.
+Construction writes, including writes through previously obtained pointers,
+must finish before publication to other readers or stable buffer acquisition.
+They cannot resume while a stable export is active.  This does not prohibit
+ordinary buffer views used entirely within private construction.
 
-Previously exported storage may be reused once exclusive ownership
-has been safely re-established under the API's existing rules.  In a
-free-threaded build, a reference count of one alone does not establish
-exclusive ownership.  Nor does that count grant permission to mutate
-arbitrary bytes objects.  Existing restrictions on mutating singletons
-and bytes with cached hashes still apply.  A successful
-``_PyBytes_Resize()`` does not itself establish exclusive ownership:
-a same-size request can return the original object unchanged.
+A stable export keeps the original bytes object alive.
+``_PyBytes_Resize()`` and ``PyBytes_Concat()`` may create a replacement
+while the export retains the original storage unchanged.  These calls
+do not require exclusive ownership of their input.  A same-size resize
+can return the original object unchanged; success does not make shared
+or hashed bytes writable.
 
-``PyBytesWriter`` already completes construction before returning the
-object, so it is unaffected.
+Storage may be reused only under the construction API's existing ownership
+rules.  In a free-threaded build, a reference count of one alone does not
+establish exclusive ownership.  Existing restrictions on modifying singletons
+and bytes with cached hashes still apply.
+
+``PyBytesWriter`` completes construction before returning the bytes object,
+so it is unaffected.
 
 
 ``memoryview``
@@ -853,10 +857,12 @@ while stable exports exist.  ``BytesIO`` also changes existing
 live-export mutation failures to ``BufferConflictError``.
 Catching the exception with ``except BufferError`` continues to work.
 
-The bytes construction rule also applies to existing C extensions.
-CPython cannot detect writes through retained pointers.  The bytes
-C API documentation will state the ownership rule explicitly and
-recommend ``PyBytesWriter``.
+Stable reads from bytes rely on the existing prohibition on mutating
+shared bytes.  C extensions that write through retained construction
+pointers while the bytes are shared already violate that contract.
+CPython cannot detect these writes.  The bytes C API documentation will
+clarify the construction and ownership rules, including the fact that a
+same-size ``_PyBytes_Resize()`` call does not make shared bytes writable.
 
 Opting in can change ``view->obj`` and release dispatch for ordinary
 possibly writable exports that previously named an underlying owner.
@@ -901,10 +907,10 @@ explicitly separate from the exporter's synchronization responsibilities.
 Implementation and Test Plan
 ============================
 
-The prototype implements the public API and checked acquisition.
-Exact ``bytes`` support, memoryview propagation, and ``BytesIO``
-coordination remain to be implemented.  Following the current proposal,
-the public headers expose the flag, exception, and type slot when
+The prototype implements the public API, checked acquisition, and
+stable reads from exact ``bytes``.  Memoryview propagation and
+``BytesIO`` coordination remain to be implemented.  Following the current
+proposal, the public headers expose the flag, exception, and type slot when
 targeting Limited API 3.16 or later; the registration function remains
 outside the Limited API.  ``_pyio.BytesIO.getbuffer()`` will accept
 ``access`` and report unsupported stable access with plain ``BufferError``.
@@ -952,8 +958,9 @@ Tests on GIL-enabled and free-threaded builds must cover:
 * coordinated pointer escape and subsequent permanent refusal;
 * early failures, base-class buffer wrappers, and recoverable malformed
   postconditions;
-* CPython's bytes construction and copy-on-write paths preserving live
-  exports, including same-size resize requests and cached hashes; and
+* CPython's bytes construction and copy-on-write paths preserving stable
+  exports, including same-size resize requests, cached hashes, concatenation,
+  and storage shared with ``BytesIO`` during concurrent reads and writes; and
 * ``BytesIO`` reinitialization conflicts leaving stream state unchanged,
   and resize allocation failures preserving backing storage and logical
   length.
