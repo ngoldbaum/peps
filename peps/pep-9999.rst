@@ -350,14 +350,12 @@ so it is unaffected.
 ``memoryview``
 ~~~~~~~~~~~~~~
 
-A stable memoryview's internal owner, the *managed buffer*, keeps the
-underlying export alive and records whether its acquisition was stable.
-
-Construction from a stable memoryview, slicing, casting,
-``toreadonly()``, and C re-exports share this owner without repeating
-the original exporter's conflict check.  The underlying export remains
-active until every view, C export, and in-flight memoryview operation
-has finished using it.
+A memoryview acquired with ``access="stable-read"`` retains the
+underlying stable export.  Construction from a stable memoryview,
+slicing, casting, ``toreadonly()``, and C re-exports preserve that
+guarantee without repeating the original exporter's conflict check.
+The underlying export remains active until every view, C export, and
+in-flight memoryview operation has finished using it.
 
 When constructing a memoryview from another memoryview, ``access``
 determines whether an ordinary acquisition is acceptable:
@@ -365,16 +363,17 @@ determines whether an ordinary acquisition is acceptable:
 ===========================  ====================  =======================
 Underlying acquisition       ``access``            Result
 ===========================  ====================  =======================
-Ordinary or stable           ``None``              Share existing owner
-Stable                       ``"stable-read"``     Share stable owner
+Ordinary or stable           ``None``              Retain acquisition
+Stable                       ``"stable-read"``     Retain stable export
 Ordinary or no acquisition   ``"stable-read"``     Plain ``BufferError``
 ===========================  ====================  =======================
 
 An ordinary memoryview cannot be upgraded to a stable one, including
 through ``PyObject_GetBuffer()``.  Making it read-only does not change
-that rule.  An ordinary request from a stable memoryview returns a
-read-only view if the requested representation is supported.  A
-``PyBUF_WRITABLE`` request fails as it does today.
+that rule, even for ordinary views of exact ``bytes``.  An ordinary
+request from a stable memoryview returns a read-only view if the
+requested representation is supported.  A ``PyBUF_WRITABLE`` request
+fails as it does today.
 
 Slices and casts remain usable after their source view is released.
 Here, ``tail`` keeps the stable export active:
@@ -386,23 +385,26 @@ Here, ``tail`` keeps the stable export active:
    view.release()
    stream.getbuffer()     # raises BufferConflictError
 
-``memoryview.release()`` still raises plain ``BufferError`` while any
-C export from that particular memoryview remains active.
-
-An already-started memoryview operation may keep the underlying export
-active after ``memoryview.release()`` returns, even when no dependent
-views or C exports remain.  The exporter must continue to reject
-conflicts until that operation no longer needs the export.
+``memoryview.release()`` raises plain ``BufferError`` while a C export
+from that particular memoryview remains active.  Views sharing the
+acquisition and already-started operations do not prevent release of
+the source view.  They keep the underlying export active for as long
+as they need it, even after ``release()`` returns.  The exporter
+continues to reject conflicts until the last such user has finished.
 
 For views that own an export, ``memoryview.obj`` continues to name the
 object from which the export was acquired.  For ``BytesIO``, this is
 the private exporter described below.
 
-Starting a memoryview operation or creating a dependent view or C
-re-export, including released-state checks and owner-count updates,
-must be synchronized with release.  The last release and GC clearing
-must not end the underlying export while a dependent view, C export,
-or in-flight operation still needs it.
+Starting an operation or creating a dependent view or C re-export
+must be synchronized with release.  Neither explicit release nor
+garbage collection may end the underlying stable export while any
+of those users still needs it.
+
+``PyMemoryView_FromBuffer()`` and ``PyMemoryView_FromMemory()`` do not
+acquire or take ownership of a stable export.  Views created by these
+functions cannot satisfy a stable request, even when the supplied
+buffer or pointer comes from a stable export that is still alive.
 
 
 ``io.BytesIO``
@@ -427,12 +429,18 @@ Conflicts raise ``BufferConflictError``.  The methods affected are
 ``write()``, ``writelines()``, ``truncate()``, ``__init__()``, and
 ``__setstate__()``, as well as the conflicting acquisitions in the
 table.  Reinitialization must check for conflicts before changing the
-stream's contents, length, or position.  Existing mutation failures
-with ordinary exports also change from plain ``BufferError`` to this
-subclass.
+stream's contents, length, or position.  Conflict and closed-state
+checks must still hold after callbacks, such as an input object's
+``__buffer__`` or a size argument's ``__index__``.  Mutation methods
+reject active exports even when the requested operation would leave
+the contents unchanged.  Existing mutation failures with ordinary
+exports also change from plain ``BufferError`` to this subclass.
 
 Reads and cursor movement remain permitted.  Each export keeps the
-backing bytes alive after close; a closed stream refuses new acquisitions.
+backing bytes alive after close.  New acquisitions from the stream or
+its private exporters then raise ``ValueError``.  Existing views remain
+usable and can still produce dependent views and C re-exports.
+Reinitialization continues to conflict while exports remain active.
 
 ``BytesIO`` does not use copy-on-write to bypass export conflicts.
 Otherwise, its copy-on-write behavior is unchanged: a stable acquisition
@@ -447,6 +455,10 @@ conflict checks.  Each export records its own kind of access.
 
 Subclasses that inherit or explicitly invoke the base ``getbuffer()``
 method retain these semantics.
+
+The pure-Python ``_pyio.BytesIO`` implementation accepts ``access`` but
+does not support stable reads.  On an open stream, ``"stable-read"``
+raises plain ``BufferError``; ``None`` retains its existing behavior.
 
 
 Exporter Requirements
@@ -907,27 +919,34 @@ explicitly separate from the exporter's synchronization responsibilities.
 Implementation and Test Plan
 ============================
 
-The prototype implements the public API, checked acquisition, and
-stable reads from exact ``bytes``.  Memoryview propagation and
-``BytesIO`` coordination remain to be implemented.  Following the current
-proposal, the public headers expose the flag, exception, and type slot when
+The prototype implements the public API, checked acquisition, stable
+reads from exact ``bytes``, propagation through ``memoryview``, and
+``BytesIO`` coordination.  Both ``memoryview`` and ``BytesIO.getbuffer()``
+accept the ``access`` keyword.  The pure-Python ``_pyio.BytesIO`` accepts
+the keyword and reports unsupported stable access as specified above.
+The public headers expose the flag, exception, and type slot when
 targeting Limited API 3.16 or later; the registration function remains
-outside the Limited API.  ``_pyio.BytesIO.getbuffer()`` will accept
-``access`` and report unsupported stable access with plain ``BufferError``.
+outside the Limited API.
 
-The implementation must not inherently conflict with the memoryview lifetime
-fixes tracked in `python/cpython#127716
-<https://github.com/python/cpython/issues/127716>`__, including keeping
-exports alive during in-flight operations.  ``BytesIO`` must preserve
-its existing per-export ownership of the backing bytes when adding
-access-mode bookkeeping, so exports remain valid after close.
+The prototype builds on the memoryview lifetime fixes tracked in
+`python/cpython#127716 <https://github.com/python/cpython/issues/127716>`__.
+In-flight operations retain the underlying export independently of the
+source view's release state on both GIL-enabled and free-threaded builds.
+``BytesIO`` coordinates acquisitions across its private exporters and
+retains each export's backing bytes after close.  Its mutation paths
+recheck conflicts and closed state after reentrant callbacks.
 
-Purpose-built static and heap test exporters will exercise both
-declaration paths, heap-type configuration followed by freezing, work
-outside domain locks, and coordinated pointer escape.  Out-of-tree
-exporters will check that the public APIs suffice.
+Regression tests cover memoryview propagation, release and GC lifetime,
+raw-wrapper restrictions, ``BytesIO`` access conflicts, callback reentry,
+allocation-failure rollback, and exports surviving close.  These tests
+have passed on GIL-enabled and free-threaded builds.  Purpose-built
+static and heap test exporters exercise both declaration paths,
+heap-type freezing, and acquisition checks, including Limited API use.
 
-Tests on GIL-enabled and free-threaded builds must cover:
+Remaining validation includes ThreadSanitizer runs, acquisition and
+contention benchmarks, out-of-tree exporters, and test exporters for
+work outside domain locks and coordinated pointer escape.  The full
+test plan for GIL-enabled and free-threaded builds includes:
 
 * stable acquisition and exporter declarations using only Limited API
   3.16, including access to the conflict exception, and version guards
@@ -949,21 +968,28 @@ Tests on GIL-enabled and free-threaded builds must cover:
   export record, and conflict checks concurrent with record removal;
 * metadata lifetime after shallow copies, dependent views, C re-exports,
   synchronized handoffs, and GC cycles with differing clearing orders;
-* stability propagation through C- and F-contiguous casts, including
-  ``cast(order="F")`` and flattening F-contiguous views;
+* stability propagation through dependent memoryviews and C re-exports,
+  including C- and F-contiguous casts, ``cast(order="F")``, and flattening
+  F-contiguous views;
+* rejection of attempts to upgrade ordinary memoryviews or raw wrappers
+  to stable views, including ordinary views of exact ``bytes``;
 * release concurrent with in-flight memoryview operations, with conflict
   protection retained until those operations no longer need the export;
+* ``BytesIO`` conflict checks shared across private exporters, including
+  acquisitions through ``memoryview.obj`` and release of copied
+  ``Py_buffer`` structures;
 * ``BytesIO`` views, dependent views, and C re-exports remaining valid
-  after close, with new acquisitions refused;
+  after close, with new acquisitions from the stream or its private
+  exporters refused;
 * coordinated pointer escape and subsequent permanent refusal;
 * early failures, base-class buffer wrappers, and recoverable malformed
   postconditions;
 * CPython's bytes construction and copy-on-write paths preserving stable
   exports, including same-size resize requests, cached hashes, concatenation,
   and storage shared with ``BytesIO`` during concurrent reads and writes; and
-* ``BytesIO`` reinitialization conflicts leaving stream state unchanged,
-  and resize allocation failures preserving backing storage and logical
-  length.
+* ``BytesIO`` mutation methods detecting conflicts before making their
+  own state changes, including after reentrant callbacks, and resize
+  allocation failures preserving backing storage and logical length.
 
 
 Rationale and Deferred Work
